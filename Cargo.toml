@@ -1,0 +1,42 @@
+[package]
+name = "paperlight"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Lightweight, fast PDF viewer"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "0.37"
+egui-winit = { version = "0.37", default-features = false, features = ["smithay-clipboard"] }
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
+crossbeam-channel = "0.5"
+raw-window-handle = "0.6"
+wayland-client = { version = "0.31", features = ["system"] }
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Paperlight
+GenericName=PDF Viewer
+Comment=Lightweight, fast PDF viewer
+Exec=paperlight %f
+Icon=paperlight
+Terminal=false
+Categories=Office;Viewer;Graphics;
+MimeType=application/pdf;
+Keywords=pdf;document;viewer;reader;
+StartupWMClass=paperlight
+StartupNotify=true
