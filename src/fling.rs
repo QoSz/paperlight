@@ -1,7 +1,7 @@
 //! Pure kinetic-scroll math: touchpad velocity on finger lift, then GTK-like exponential decay.
 
 /// GTK's kinetic friction, per second: speed decays as `exp(-DECEL·t)`, so a fling coasts `v0 / DECEL`.
-pub const DECEL: f32 = 4.0;
+const DECEL: f32 = 4.0;
 /// A fling stops below this speed, in points per second.
 const STOP_SPEED: f32 = 10.0;
 /// A finger lift slower than this, in points per second, does not fling.

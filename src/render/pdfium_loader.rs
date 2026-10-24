@@ -9,7 +9,7 @@ pub const LIB_NAME: &str = "libpdfium.so";
 
 /// Ordered libpdfium files to try before the system library: `env_override` (a file path; ignored
 /// if empty), `exe_dir/libpdfium.so`, `home/.local/lib/paperlight/libpdfium.so`.
-pub fn candidate_paths(
+fn candidate_paths(
     env_override: Option<&OsStr>,
     exe_dir: Option<&Path>,
     home: Option<&Path>,

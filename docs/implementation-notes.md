@@ -196,3 +196,231 @@ Change: `layout::TOUCHPAD_SCROLL_MULTIPLIER` (1.0) is replaced by `touchpad_poin
 before egui and the velocity tracker see them. The fling velocity therefore scales too, as in GTK 3.
 `wheel_notch_points` gains GTK's `min(_, page / 2)` cap (only matters for viewports under 8 pt).
 Tests: 85 pass. Not verified by hand (same reason as before).
+
+## Round 4: rotation, limitations, Ctrl+W, selection colour
+
+Requested 2026-10-23: quit with Ctrl+W, rotate the document, fix the README's known
+limitations, a blue selection highlight instead of the brown one, and a dead-code sweep.
+
+| Change | Where | Notes |
+|---|---|---|
+| `Rotation` (quarter turns) with `point`, `rect`, `size`, `uv_corners` | `layout.rs` | One type for both the page's `/Rotate` (worker) and the viewer rotation (UI). `PageLayout::new` and `fit_width_scale` take it; `to_doc` applies it; new `to_page` inverts it (used by `selection::probe`). |
+| Rotation is UI-only | `ui/viewer.rs` | Pages render unrotated. `page_mesh` draws the texture with turned UVs, so a rotation costs no render and keeps the cache. `ViewerState::rotate(clockwise, page)` sets `pending_page`, which `show()` resolves with `go_to_page` after the relayout. Ctrl+→ / Ctrl+← and the toolbar ↻. Reset on open. |
+| `/Rotate` and off-origin boxes fixed | `render/worker.rs` | `PageFrame::of(page)` reads `boundaries().bounding()` (= `FPDF_GetPageBoundingBox`, the box pdfium renders) and `page.rotation()`; `to_page` replaces `flip`. End-to-end test opens a `/Rotate 90` page with `MediaBox [20 10 632 802]` and checks the text lands at the top-right. |
+| Password prompt | `worker.rs`, `app.rs` | `Cmd::Open { path, password }`; `PasswordError` → `Msg::NeedsPassword { path, wrong }` → `Status::Password` draws a focused password field in the canvas; Enter re-opens with the password. |
+| Failed render shown | `render/cache.rs`, `worker.rs`, `viewer.rs` | `Msg::RenderFailed` → `PageCache::fail` (also fixes the key staying in `in_flight` forever) → the page shows "Page N could not be rendered" in `error` and is not requested again. |
+| Text loaded for visible pages | `app.rs` | `request_texts(visible, wanted)` requests the visible pages' chars, so the text cursor and double-click work before any press; chars of pages outside visible ±2 are dropped unless selected (bounded memory on long documents). |
+| Double / triple click | `selection.rs`, `viewer.rs` | `word_at`, `line_at` (line = `same_line` neighbours plus the trailing zero-size line breaks); `Selection::select(page, range)` sets a fixed range that `resolve` leaves alone. |
+| System theme | `system_theme.rs` | `gsettings get` once, then a `gsettings monitor` child read on a thread; `ctx.set_theme`. Child killed in `on_exit`. Not GNOME → stays dark. |
+| Ctrl+W | `app.rs` | `ViewportCommand::Close`. |
+| Selection colour | `ui/theme.rs` | `selection_bg` is blue (`#3D8BF2` / `#4F97F5`); `SELECTION_ALPHA` (0.35) now lives in `theme.rs` and is applied both to the page highlight and to egui's `selection.bg_fill`, so field selections match. |
+| Dead-code sweep | all | Audit found no unreachable code, unused dependency, feature or asset. 14 items were `pub` without a user outside their module and are now private. `egui-winit` and `winit` stay as feature-only dependencies (see R1 and the title-bar section). |
+
+Not fixed, by design: the ≤1.5× bilinear softness between buckets (see the mipmap row above),
+X11 clipboard, pinch and finger-lift (platform). `docs/architecture.md` remains the phase 5
+contract; its module tree and signatures predate rounds 2–4.
+
+Review fixes (round 4): password Enter was hidden by the refocus (`submit` computed first);
+Ctrl+←/→ moved below the `free` guard so word navigation in a text field does not rotate;
+`line_at` keeps boxless generated spaces inside the line; `pending_page` is taken even without a
+relayout; the worker handles queued `Render`s before `Text`s; `system_theme::watch` gives up when
+`gsettings get` fails (schema missing); `PageCache::failed` is keyed on `(page, scale)`; the old
+document is dropped before the new one loads; `Drop for App` also kills the theme child.
+
+## Round 5: Apple-style interface
+
+Requested 2026-10-23: "make it an Apple-esque design". The user chose a unified title bar
+(window buttons drawn by the app) over keeping GNOME's title bar above the toolbar.
+`docs/design.md` is rewritten for the new direction.
+
+| Change | Where | Notes |
+|---|---|---|
+| Undecorated window, unified 52 pt bar | `main.rs`, `ui/chrome.rs`, `ui/toolbar.rs` | `with_decorations(false)`. Traffic lights send `Close` / `Minimized(true)` / `Maximized(!max)`. `chrome::title_bar` puts a `click_and_drag` interact over the bar before the controls: drag → `StartDrag`, double-click → toggle maximize. `chrome::window_edges` runs after the panels (`App::ui` now calls `App::show`, then it): 5 pt edge bands and 12 pt corners with `Sense::drag` only, so the press starts `BeginResize` without a drag threshold; plus a 1 pt outline. Both skipped while maximized or fullscreen. |
+| `winit` dependency removed | `Cargo.toml` | It existed only for `wayland-csd-adwaita` (GNOME title bar). With no decorations it was dead weight; `sctk-adwaita` and its renderer are gone from the tree. |
+| Inter bundled | `assets/fonts/`, `ui/theme.rs` | Regular + SemiBold (Fedora's `rsms-inter-fonts` 4.1, OFL). Inter leads `Proportional`; SemiBold is a named family used by `TextStyle::Heading`; egui's defaults stay as fallbacks. ~830 KB in the binary. |
+| Apple palette | `ui/theme.rs` | Apple greys, system blue `#007AFF` / `#0A84FF`, system yellow/orange hits. `SELECTION_ALPHA` 0.3 gives macOS's `#B3D7FF` over white. `selection.stroke` is now `text_primary`, so selected field text stays legible (egui draws selected text in that colour). A unit test checks every text/surface pair against WCAG AA. |
+| Vector icons | `ui/controls.rs` | `Icon` painted with 1.5 pt lines: replaces Unicode `▲▼` and `↻`. `↻` was not in Ubuntu-Light and rendered as a missing-glyph box in round 4. |
+| Fields | `ui/controls.rs` | `controls::field` passes its own `Frame` to `TextEdit::frame` (fill, radius 7, leading-icon inset) and paints a 3 pt accent halo at 50 % while focused. Used by search, page and password fields. |
+| Title block | `ui/toolbar.rs` | File name (semibold) over "Page n of m", painted as two truncated galleys centred on the bar (egui cannot centre a column of widgets). Labels are non-selectable so dragging the title moves the window. |
+| Page chevrons | `ui/toolbar.rs` | `‹ ›` around the page field reuse `ToolbarAction::GoToPage`. |
+| No scroll fade | `ui/theme.rs` | egui 0.37 fades scroll-area edges into the panel colour; it showed as a grey band over the page bottom. `scroll.fade.strength = 0`. |
+| Softer page shadow | `ui/viewer.rs` | Offset `[0, 4]`, blur 18. |
+
+Verified by screenshots of the debug build under Xwayland (`import -window`), light and dark,
+with a document, empty and password-protected. Not verifiable without a pointer: dragging,
+double-click maximize and edge resize on Wayland (code paths follow egui's
+`custom_window_frame` example).
+
+Review fixes (round 5): the title bar, traffic lights and resize bands used focusable senses,
+so Tab could land on Close (Enter would quit) or on the invisible bar (canvas keys stopped);
+they now use `Sense::CLICK` / `DRAG` constants. The compositor never returns the button
+release of a move or resize, which left egui dragging (every second window move did nothing,
+the resize cursor stuck, hover hidden): `chrome::release_after_grab` injects it. Resize needs
+the primary button and focus. Scroll bars moved 5 pt in (`bar_outer_margin`) so the edge bands
+no longer take their drags. The page chevrons use `step_page` (a `± 1` on `current_page`
+re-introduced the V1 skip with short pages). The page field sized itself at 36 pt including
+padding, clipping three-digit numbers; it is now sized from the page count. Below ~580 pt the
+right-hand controls slid under the traffic lights (clicking the search field could hit Close):
+the search field now shrinks to 96 pt and the minimum window width is 640.
+
+Follow-up (round 5): the user is on Fedora/GNOME, so the window buttons moved from the macOS
+left side to the right end of the bar, in GNOME's default order (minimize, maximize, close;
+the user's `button-layout` is `appmenu:minimize,maximize,close`). They are added first in the
+right-to-left layout, so the other controls can never cover them; the search field now only
+reserves room for the title. The macOS colours stay.
+
+Follow-up 2 (round 5): the user did not want the macOS look for the window buttons either.
+`chrome::window_buttons` now draws them like libadwaita header-bar buttons: 24 pt circles
+filled with the text colour at 10 / 15 / 30 % (rest / hover / pressed), symbolic minimize,
+maximize (restore while maximized) and close icons always visible, no red/yellow/green.
+
+## Round 6: optimisation (perf, leaks, memory, simplicity)
+
+Requested 2026-10-24: optimise performance, fix memory leaks, reduce memory use and simplify the
+code, with zero regressions and no visible change except bug fixes. Four reviews found the
+problems (headless harness `F*`, leaks `SEN-*`, render speed `T*`, simplicity `RZ*`). The user
+accepted all of them; the plan rejected T4, F5 and an asynchronous `gsettings get`, and left F1b
+to the user. Every behaviour change was written test first.
+
+| ID | Change | Where | Notes | Test |
+|---|---|---|---|---|
+| RZ1 | `PAPERLIGHT_LOG` is parsed as a `Targets` filter; `tracing-subscriber` without `env-filter` | `main.rs`, `Cargo.toml` | Drops matchers, regex-automata, regex-syntax and aho-corasick, about −490 KB of binary. `debug`, `paperlight=debug` and `paperlight=debug,warn` behave as before. `log` records from eframe and winit are still bridged (`try_init` installs `LogTracer`). | gate |
+| RZ2 | `caret(page, index)` helper | `selection.rs` | Was a test helper; replaces nine `Caret { .. }` literals. | selection tests |
+| RZ3 | `PageFrame.bbox` is the `PdfRect`; `map` merged into `to_page` | `render/worker.rs` | Same arithmetic (`width()` is `right - left`). | `frame_*` (built with `PdfRect::new_from_values`), `worker_end_to_end` |
+| RZ4 | `std::sync::mpsc` replaces `crossbeam-channel` | `app.rs`, `render/worker.rs`, `input/pinch_wayland.rs`, `Cargo.toml` | Only `channel`, `send`, `try_recv`, `try_iter`, `recv`, `recv_timeout` and `for … in &rx` are used. std's mpsc is crossbeam's implementation since Rust 1.67. | `worker_end_to_end` |
+| RZ5 | `App::no_doc(ctx, status)` | `app.rs` | One place for the "no document" reset of `OpenFailed`, `LibraryMissing` and `NeedsPassword` (G2). | gate |
+| RZ6 | The render generation lives in `PageCache` | `render/cache.rs`, `app.rs` | `start_batch` returns `(generation, keys)`; `App.render_gen` is gone. Never reset, so a new document's renders are newer. | `start_batch_*` |
+| RZ7 | Zoom group returns `zoom_in.or(fit).or(zoom_out)` | `ui/toolbar.rs` | The form `page_group` already uses; same priority and widget order. | gate |
+| RZ8 (= SEN-7) | `PageTexts` holds `Box<[CharBox]>` | `selection.rs` | No `Arc` was ever cloned. `Arc::from(Vec)` copied every page's chars into a new allocation; the box keeps the `Vec`'s. | selection tests |
+| SEN-1 | `gsettings monitor` gets `PR_SET_PDEATHSIG` (SIGKILL) in `pre_exec`; `watch` returns `()` | `system_theme.rs`, `app.rs`, `Cargo.toml` | The child was orphaned on every exit that skipped `on_exit`: a crash, `kill`, OOM, and any panic in release builds (`panic = "abort"`, so `Drop for App` never ran there). `die_with_parent` also checks `getppid()` after the `prctl`, which closes the fork race. PDEATHSIG fires when the spawning thread exits; `App::new` runs on the main thread (eframe calls the app creator on the event-loop thread), so that is process exit. `App.theme_watch`, `kill_theme_watch` and `Drop for App` are deleted; `on_exit` only exits. | `child_dies_with_spawning_thread` |
+| F3 (+ F3b) | A frame that forces a scroll offset runs without egui's rubber band | `ui/viewer.rs` | egui 0.37 steps a forced offset against last frame's `max_offset` (`scroll_area.rs:918-919`, `:993`). Zooming in grows the content, so the offset lay past the old edge: one spring step, then about 18 pt of coasting over 1.8 s with a repaint every frame (the 17 px, 1.85 s slide on the 2nd zoom step). Later steps anchored on the drifted offset, and near the end of a document zooming in threw the view back by pages. The offset is already clamped to this frame's layout (`ViewerState::clamp`). Rubber-banding on other frames is unchanged. | `zoom_in_keeps_centre_without_sliding`, `zoom_in_at_document_end_stays_put` (headless `ctx.run_ui` frames) |
+| SEN-5 | `Msg::Page` is uploaded only if `scale_px <= doc.max_px` | `app.rs` | When two opens race, render commands sent for document A can run on document B at A's scale, past B's GPU limit, where egui_glow asserts. Legitimate requests are always `<= max_px`. | none (needs an eframe window) |
+| SEN-6 | `open()` clears the texture cache | `app.rs` | The old document's textures stayed allocated through "Opening…". With `doc = None` the cache is never read. | none (needs an eframe window) |
+| T1 (= F2, SEN-2) | PDFium renders straight into the `ColorImage` | `render/worker.rs`, `Cargo.toml` | `PdfBitmap::from_bytes` over `ColorImage::as_raw_mut`, pre-filled opaque white, with `clear_before_rendering(false)`. pdfium-render already asks PDFium for RGBA byte order, and with alpha 255 those bytes are a valid `Color32`, so `as_rgba_bytes` (a copy) and `from_rgba_unmultiplied` (a copy and a per-pixel pass) are gone. Renders measured 40–64 % faster on text pages; one page buffer per render instead of three. The size is `(pt × scale).round()`, as pdfium-render's `apply_to_page` computes it. | `worker_end_to_end`: every alpha 255, white corner, some ink (it passed on the old path too), and a red square renders red (an R/B swap turns it blue) |
+| F1 | Pixel buffers of zoomed-in renders get a capacity above glibc's 32 MiB dynamic mmap ceiling | `render/worker.rs`, `ui/viewer.rs`, `layout.rs`, `app.rs` | After one zoom, freed zoom buffers stayed in the worker's malloc arena for the rest of the session (+50–60 MB RSS). The UI marks a render as zoomed when its render scale (bucketed and GPU-capped) is above the one fit width would use for the current viewport (`layout::zoomed_in`; `ViewerOutput.zoomed` → `Cmd::Render { zoomed }`). Unless the arena has a free chunk that big, malloc then maps the buffer on its own and unmaps it on free, without raising glibc's mmap threshold (mallopt(3)); only the touched pages become resident. Fit-width and zoomed-out buffers stay on the heap at any window size or display scale and keep their warm reuse. Bench, fit → zoom → fit: final anon 5–13 MB (T1 alone 34–42 MB, before 63 MB). A global `mallopt` or tunable was rejected: it also maps PDFium's image buffers (+28 % render time on image pages). Amendment 1: the first version picked buffers by size (≥ 6 MiB), but fit width passes that from a ~982 pt wide window or a 1.2 display scale (a maximized 1080p window renders Letter at 4 px/pt), and those fit-width renders lost T1's whole gain to page faults. Amendment 2: render scales are compared, not zoom factors, so zoom steps that stay in fit width's bucket keep the heap (they paid +8–10 ms of page faults per render for no memory gain). | `zoomed_in_compares_render_scales`, `pixel_capacity_maps_only_zoomed_buffers` |
+| SEN-3 | When zoomed in (the F1 rule), prefetch and retain windows are also limited by distance: `PageLayout::window(view, pages, viewports)` | `layout.rs`, `ui/viewer.rs`, `app.rs`, `render/cache.rs` | Zoomed in, `ViewerOutput.prefetch` is visible ±1 within `PREFETCH_VIEWPORTS` (2) view heights and `keep` is visible ±2 within `KEEP_VIEWPORTS` (4); at fit width's render scale and below they are exactly ±1 / ±2 (`PageLayout::around`), as before. `PageCache::retain(keep, visible, wanted)` loses its internal ±2. The limits change nothing while a page plus its gap is at most 2 view heights (both windows change at that point, measured; for Letter in a 1048 pt view, up to about 260 % zoom); at 600 % about 2 fewer textures (~62 MB at ppp 1, ×4 on HiDPI) and fewer off-screen renders. `request_renders` no longer takes `pages` (deviation #3). Amendment 2: the limits first applied at fit width too, where in a maximized 1080p window (A4 or Letter taller than 2 view heights) slow pages showed white while scrolling where the old windows showed none. | `window_matches_page_windows_up_to_250_percent`, `window_skips_far_neighbours_at_600_percent`, `fit_width_keeps_page_windows_in_a_maximized_window`, `retain_drops_pages_outside_keep`, `retain_*` adapted |
+| T2 | Visible pages are requested before off-screen ones | `layout.rs`, `app.rs` | `visible_first(visible, prefetch)`: the pages on screen, then the one above, then below. Before, the page above the viewport rendered first after every settle or jump. The set of keys is unchanged. | `visible_first_orders_visible_then_above_then_below` |
+| T3 (= SEN-4, F4) | A visible page's chars are requested once the page shows something; the worker serves the newest queued text first | `render/cache.rs`, `app.rs`, `render/worker.rs` | `PageCache::painted`: a texture of any scale, or the failure note (what `viewer::paint` draws). `next_index`: the first command that is not a `Text`, else the last `Text`. Pages that a fling or a scroll-bar drag passes before their render no longer queue an extraction (29 ms each on vector pages), and with a backlog the page on screen goes first. The pressed and selected pages (`want_text`) are not gated; search is unchanged. | `painted_after_texture_or_failure`, `next_index_runs_renders_first_then_newest_text` |
+
+### Deviations (round 6)
+
+- RZ1: `PAPERLIGHT_LOG` no longer takes EnvFilter-only syntax (span filters such as
+  `[span{field=..}]`, regex field values). Such a value falls back to `warn`. The README's
+  examples (`debug`, `paperlight=debug`) still work. An empty `PAPERLIGHT_LOG` now logs errors
+  (before: nothing), and an empty segment (`warn,,paperlight=debug`) adds an `error` default
+  that overrides `warn`. Kept as is: no documented form changes.
+- RZ4: channels are `std::sync::mpsc`, against architecture.md:32 ("Every channel is
+  `crossbeam_channel::unbounded()`"). The semantics are the same: unbounded, and an error once
+  the other side is gone.
+- SEN-1: supersedes round 4's "Child killed in `on_exit`" and the round-4 review fix "`Drop for
+  App` also kills the theme child". The kernel now kills the child on every exit path.
+- SEN-6: G2 still holds: `forget_doc` runs in every reply arm, because the first file's `Opened`
+  can arrive after a second `open()`. Only the cache is now also cleared in `open()`.
+- T3: updates round 4's "Text loaded for visible pages" row. A visible page's chars are requested
+  after its first texture (or failure note), and queued text loads run newest first instead of in
+  order. The round-4 review fix "the worker handles queued `Render`s before `Text`s" still holds.
+- F3: frames that force an offset run without rubber-banding. Zoom anchoring is now exact, so the
+  harness's four `*-zoom-max` screenshots show the page further right, at the centred position.
+  Near the end of a document, zooming in no longer jumps back pages.
+- SEN-3: when zoomed in (render scale above fit width's), off-screen pages are prefetched within
+  `PREFETCH_VIEWPORTS = 2.0` and kept within `KEEP_VIEWPORTS = 4.0` view heights, as well as
+  ±1 / ±2 pages. Once a page plus its gap is taller than 2 view heights, a page whose render takes
+  longer than scrolling 2 view heights (vector or scanned pages at ordinary wheel speed; text
+  pages practically never) can show white until it lands, where the page windows started that
+  render one page plus gap ahead instead; textures two pages away are also dropped sooner. At fit
+  width's render scale and below, the page windows apply exactly as before round 6.
+
+### Cargo.toml changes (round 6)
+
+| Change | Reason |
+|---|---|
+| `crossbeam-channel` removed | RZ4. |
+| `tracing-subscriber = "0.3"`, without `env-filter` | RZ1. |
+| `libc = "0.2"` | SEN-1 (`prctl`, `PR_SET_PDEATHSIG`, `getppid`). libc 0.2.191 was already in Cargo.lock through other crates, which gains only the dependency edge. |
+| `egui = { version = "0.37", features = ["bytemuck"] }` | T1 (`ColorImage::as_raw_mut`). eframe and egui_glow already enabled it; now explicit. Cargo.lock is unchanged. |
+
+Net: −6 crates. Cargo.lock loses aho-corasick, crossbeam-channel, matchers, regex-automata and
+regex-syntax; crossbeam-utils stays locked but is no longer built on Linux. The release binary
+went from 10,062,112 to 9,562,872 bytes.
+
+### Residual risks (round 6)
+
+- Memory at extreme zoom (replaces the GOD-review bullet): one page is still one texture (no
+  tiling). An A0 page at 600 % is about 0.5 GB of RGBA, and a Letter page at 600 % on a 2× HiDPI
+  screen is about 125 MB. The transient peak of a render is now one page buffer instead of three
+  (T1), and zoomed in past fit width's render scale, textures are kept only within 4 view heights
+  and prefetched within 2 (SEN-3). `max_scale_px` still prevents the egui_glow assert, not the memory use.
+- F1b (user decision, default keep): PDFium's own image-decode working set (~100 MB on the
+  image-heavy fixture) stays in the worker's arena for reuse. It is there before any zoom.
+  Releasing it (`M_ARENA_MAX=1` and an idle `malloc_trim`, or a fixed mmap threshold) costs
+  +20–40 % per image render.
+- Zoomed-in renders fault their pages in on every render: +1.6–2.1 ms for a fresh 4.4 MB
+  mapping on this machine, +1–2 ms measured in a zoom sequence. They are still faster than before
+  T1 (@4.0 p50 about −50 %). Fit width and zoomed out keep T1's speed at any window size or
+  display scale. THP would make this cheaper, but this machine falls back on 42 % of THP faults.
+- Fit width in large windows (R2-1): fit width keeps T1's speed and also T1's memory, because
+  fit-size buffers are reused from the worker's arena on purpose. In a maximized 1080p window
+  the arena keeps about 90–120 MB of fit buffers, about the baseline level. The F1 gain applies
+  only after zooming in past fit width's render scale; there, fit width already renders at the
+  top bucket (4×), so zooming in never changes the render scale and F1 never applies.
+- F1 relies on glibc's dynamic mmap threshold. On another libc the larger capacity is only
+  reserved address space. When the arena already holds a free chunk of 32 MiB or more (large
+  PDFium decode buffers, F1b), a zoom buffer reuses it and goes back to the arena, as before.
+- T1 relies on PDFium keeping alpha at 255 over the opaque white fill, and on pdfium-render's
+  RGBA byte order. `worker_end_to_end` asserts both (a red square that an R/B swap turns blue),
+  and the harness compares every screenshot.
+
+### Checked and not changed (round 6)
+
+- **T4** (keep the last few `PdfPage`s open in the worker): they hold decoded images (~30 MB per
+  scanned page), against the memory goal; the drop order of `PdfPage`s is not checked by the
+  compiler; there is no gain on text pages.
+- **F5** (most of the RSS is shared Mesa and LLVM mappings): nothing to do in app code. Judge
+  memory by PSS, anonymous memory and the high-water mark.
+- **Asynchronous `gsettings get`** at startup: 2–5 ms, and the first frame could show the wrong
+  theme.
+- **A defensive unmultiply after T1**: 1.35 ms per megapixel (19 % of the gain) for output that
+  PDFium does not produce.
+
+### Verification (round 6)
+
+- `cargo test` with `PAPERLIGHT_PDFIUM` set: 116 pass (104 before, plus SEN-1 1, F3 2, F1 2,
+  SEN-3 4, T2 1, T3 2). `worker_end_to_end` runs; it does not skip. `cargo clippy --all-targets
+  -- -D warnings` and `cargo fmt --check` are clean after every step.
+- Headless harness (mutter `--headless`, 900×1100 window at scale 1, five fixtures; ABAB pairs
+  plus extra pairs, 96 sessions), run on the first round-6 build, before amendment 1 (which
+  changes only the zoomed-in buffer capacity, an error code, a test and these notes). No
+  regression found:
+  - 29 of 33 screenshots identical. The four `*-zoom-max` shots are the F3 fix: an exact shift of
+    51 / 51 / 69 / 51 px, dy 0, toolbar identical. After the shift the only difference is ±1
+    level, egui's screen-space dithering (keyed to `gl_FragCoord`), so a literal AE = 0 cannot
+    hold for any move.
+  - No orphan, the same threads, fds and render counts, no lost text load, 0 CPU and 0 context
+    switches in every idle scenario.
+
+  | Area | Measure | Baseline → after |
+  |---|---|---|
+  | Render time | text400 fit (@1.5) p50 | 16.1 / 14.3 → 6.6 / 7.2 ms (median over all pairs −38 %) |
+  | Render time | text400 @4.0 p50 | 79 / 88 → 43 / 42 ms (median −38 %) |
+  | Render time | mixed p50 | 9.8 / 10.8 → 6.7 / 6.4 ms |
+  | Render time | text400 worker CPU | −43 % (median −26 %) |
+  | Memory | text400 final anon / RSS / HWM | 78–81 → 34–40 MB / 131–135 → 88–93 MB / 191–195 → 148–149 MB |
+  | Memory | vector30 final anon | 68 → 33–34 MB |
+  | Memory | HWM mixed / images | 263 → 145 MB / 278 → 218 MB |
+  | Memory | mixed max GPU | 164 → 98 MB |
+  | Settle | zoom-in max: text400 / mixed / images | 1.85 → 0.23 s / 1.85 → 0.25–0.30 s / 1.86 → 0.36–0.45 s |
+  | Settle | zoom at document end (End, 8× Ctrl+=) | 6.0 s and 75 pages lost → 0.24 s, stays on page 400 |
+  | Processes | gsettings child after SIGTERM / SIGKILL | orphaned → gone in ≤ 16 ms |
+
+  - Target missed: zoom-cycle1 main-thread CPU is 0.74× / 0.78× of baseline (0.70–0.94× in the
+    extra pairs) against a 0.6× target. The repaint storm of the 2nd zoom step is gone (100–201 →
+    25–36 ms); the remaining ~260–440 ms is texture upload and painting, which F3 does not touch.
+  - Checks that failed as worded but are noise or artefacts: mixed final anon +1.4 MB (inside
+    baseline's own spread, flat); text400 max GPU resident +15 % in 4 of 7 pairs (Mesa's
+    purgeable buffer cache; live GPU memory equal); the zoom-cycle anon slope (one ~8.4 MB fit
+    buffer kept or trimmed, no growth over 12 cycles); one noisy pair each for images and vector30
+    render p50; F1's cost in plan run 3 (interleaved runs: no cost).
+  - text400 startup anon +4.2 MB: one fit buffer kept in the arena below glibc's trim threshold,
+    by design. The session's final anon is still −43 MB.
+  - Amendments 1 and 2 (F1 and SEN-3 only when zoomed in past fit width's render scale; wider
+    window and scale 2) are verified separately.

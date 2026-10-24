@@ -27,6 +27,9 @@ uses no CPU while idle, and scrolls the way a GTK app on a touchpad should.
 
 ## Features
 
+- **Apple-style interface.** One unified title bar with GNOME-style window
+  buttons on the right, Inter type, system-blue accents, line icons and soft
+  page shadows, in light and dark.
 - **Fast open.** The window appears at once and pages stream in from a
   background render thread.
 - **Smooth zoom.** Pages render at a few fixed scales. In between, the GPU scales
@@ -34,8 +37,13 @@ uses no CPU while idle, and scrolls the way a GTK app on a touchpad should.
 - **Touchpad that feels right.** Scroll distance matches Evince (GTK 3 scrolls
   `page^(2/3)/10` points per finger pixel, about nine times GTK 4's 1:1) and
   keeps coasting after you lift your fingers, slowing down with GTK's friction.
-- **Search** with a match counter and ▲ ▼ navigation, highlights on the page.
-- **Text selection** by drag, across page boundaries, with Ctrl+C to copy.
+- **Search** with a match counter and ⌃ ⌄ navigation, highlights on the page.
+- **Text selection** by drag, across page boundaries; double-click a word,
+  triple-click a line; Ctrl+C to copy.
+- **Rotate** the document a quarter turn at a time, instantly: the rendered
+  pages are turned on the GPU, nothing is re-rendered.
+- **Encrypted PDFs** ask for their password.
+- **Follows the GNOME light/dark setting**, live.
 - **Pinch to zoom** on Wayland touchpads, Ctrl+scroll everywhere.
 - **Idle means idle.** No CPU use when nothing changes.
 - **Opens as your default viewer.** One script installs the binary, icons and
@@ -48,7 +56,8 @@ printing.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ report.pdf        [ search…        ] 3 / 12 ▲ ▼      [ 12 ] / 48   − 100% + │
+│ report.pdf     (⌕ search…   ) 3 / 12 ⌃ ⌄  ‹ [12] / 48 ›  − 100% +  ↻  _ □ × │
+│ Page 12 of 48                                                            │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │                         ┌──────────────────┐                             │
@@ -71,16 +80,22 @@ default handler.
 | `Ctrl+F` | Focus the search field |
 | `Enter` / `Shift+Enter` (in search) | Next / previous match |
 | Drag over text | Select text (may span pages); a click clears it |
+| Double-click / triple-click | Select a word / a line |
 | `Ctrl+C` | Copy the selected text |
 | `Esc` | Clear the search and the selection |
 | `Ctrl+=` or `Ctrl++` / `Ctrl+-` | Zoom in / out |
 | `Ctrl+0`, or click the zoom % | Fit width (the default on open) |
+| `Ctrl+→` / `Ctrl+←`, or click ↻ | Rotate clockwise / counter-clockwise |
+| `Ctrl+W` | Quit |
 | `Ctrl+scroll`, touchpad pinch | Zoom at the pointer |
 | `PageDown` / `PageUp` | Scroll one screen |
 | `↓` / `↑` | Scroll a little |
 | `→` / `←` | Next / previous page |
 | `Home` / `End` | First / last page |
-| Page field + `Enter` | Go to that page |
+| Page field + `Enter`, or click ‹ › | Go to that page / the previous or next page |
+| Drag the title bar | Move the window |
+| Double-click the title bar, or click □ | Maximize / restore |
+| Drag a window edge or corner | Resize |
 
 ## Install
 
@@ -149,8 +164,19 @@ want to change:
 - **Wayland pinch.** winit 0.30 does not expose touchpad gestures on Wayland,
   so Paperlight binds `zwp_pointer_gestures_v1` on winit's `wl_display`
   itself (`src/input/pinch_wayland.rs`).
-- **Kinetic scroll.** Finger lift arrives as `TouchPhase::Ended`; velocity is
+- **Kinetic scroll.** Finger lift arrives as `TouchPhase::End`; velocity is
   tracked with an EMA and decayed with GTK's friction (`src/fling.rs`).
+- **Rotation.** Pages are rendered unrotated and drawn as a mesh with turned
+  texture coordinates, so rotating costs nothing. Text boxes from PDFium are in
+  unrotated user space; the worker maps them through the page's visible box
+  and `/Rotate` (`PageFrame` in `src/render/worker.rs`), and the layout applies
+  the viewer rotation on top (`Rotation` in `src/layout.rs`).
+- **System theme.** winit does not report it on Linux, so `gsettings` is read
+  once and `gsettings monitor` is followed (`src/system_theme.rs`).
+- **Window chrome.** The window is undecorated. `src/ui/chrome.rs` draws the
+  window buttons, moves the window when the title bar is dragged
+  (`ViewportCommand::StartDrag`), maximizes on double-click and resizes from
+  5 pt bands along the edges (`ViewportCommand::BeginResize`).
 
 Design notes, the API facts verified against crate sources, and every
 deviation from the original plan are in [`docs/`](docs/).
@@ -170,31 +196,31 @@ Source layout:
 
 ```
 src/
-├── main.rs          entry, logging, PDFium lookup
-├── app.rs           eframe App: state, events, frame loop
-├── layout.rs        page geometry, scroll math, touchpad scaling
+├── main.rs          entry, logging, window
+├── app.rs           eframe App: state, events, frame loop, password form
+├── layout.rs        page geometry, rotation, scroll math, touchpad scaling
 ├── fling.rs         kinetic scrolling
 ├── search.rs        search state and match navigation
 ├── selection.rs     text selection and clipboard
+├── system_theme.rs  GNOME light/dark setting via gsettings
 ├── input/           Wayland pinch gesture binding
 ├── render/          worker thread, texture cache, PDFium loader
-└── ui/              toolbar, viewer, theme
+└── ui/              title bar, window chrome, controls, viewer, theme
 ```
 
 ## Known limitations
 
-- Password-protected PDFs are not supported (an error is shown).
-- Search highlights and text selection are misplaced on pages with `/Rotate`
-  other than 0 or a MediaBox that does not start at the origin.
-- A page's text is read the first time you press on it, so the text cursor
-  appears over a page only after the first click or drag there. No double-click
-  word or triple-click line selection.
 - Between render scales, text is downsampled by at most 1.5× (bilinear), so it
-  can look slightly soft until the exact scale arrives.
-- A page that fails to render stays white.
-- The app always uses its dark palette: winit 0.30 does not report the system
-  light/dark setting on Linux. The window title bar does follow the GNOME
-  setting, read when the window opens.
+  can look slightly soft for the ~100 ms until the exact scale arrives. This is
+  the price of never stalling while zooming.
+- Rotation is not saved; a document opens unrotated.
+- The window has square corners and no drop shadow: GNOME draws neither for
+  an undecorated window. The window buttons are always minimize, maximize,
+  close on the right (GNOME's default); GNOME's `button-layout` setting is not
+  read.
+- The light/dark setting is read with `gsettings` from
+  `org.gnome.desktop.interface color-scheme`. Without GNOME's schema (other
+  desktops) the app stays dark.
 - Touchpad pinch on Wayland uses `zwp_pointer_gestures_v1` (GNOME, KDE and most
   compositors have it). On X11, use Ctrl+scroll.
 - Copy uses the Wayland clipboard. In an X11 session, copied text stays inside
@@ -202,4 +228,5 @@ src/
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The bundled Inter font is under the SIL Open Font
+License 1.1 ([`assets/fonts/Inter-LICENSE.txt`](assets/fonts/Inter-LICENSE.txt)).

@@ -1,6 +1,6 @@
 //! Pure text-selection logic: char picking, reading-order ranges, highlight runs and copy text.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range};
 
 use egui::{Pos2, Rect};
 
@@ -17,14 +17,14 @@ pub struct CharBox {
 }
 
 /// Chars of every page loaded so far, by page index.
-pub type PageTexts = HashMap<usize, Arc<[CharBox]>>;
+pub type PageTexts = HashMap<usize, Box<[CharBox]>>;
 
 /// A position between chars in reading order: before char `index` of `page`
 /// (`index == len` is after the page's last char).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Caret {
-    pub page: usize,
-    pub index: usize,
+    page: usize,
+    index: usize,
 }
 
 /// Where a doc-space point lies relative to the pages.
@@ -65,6 +65,14 @@ impl Selection {
         self.range = None;
     }
 
+    /// Selects the chars `indices` of `page` outright (double- and triple-click). Not dragged, so
+    /// `resolve` leaves it alone.
+    pub fn select(&mut self, page: usize, indices: Range<usize>) {
+        self.anchor = None;
+        self.head = None;
+        self.range = Some((caret(page, indices.start), caret(page, indices.end)));
+    }
+
     /// Moves the dragged end. Call `resolve` after.
     pub fn drag_to(&mut self, head: Probe) {
         self.head = Some(head);
@@ -76,13 +84,14 @@ impl Selection {
 
     /// No selection started (an unresolved one is not empty).
     pub fn is_empty(&self) -> bool {
-        self.anchor.is_none()
+        self.anchor.is_none() && self.range.is_none()
     }
 
-    /// Pages from the anchor's to the head's, in order; empty without a selection.
+    /// Pages from the anchor's to the head's (or of the range), in order; empty without a selection.
     pub fn pages(&self) -> Range<usize> {
-        match (self.anchor, self.head) {
-            (Some((a, _)), Some(head)) => a.min(head.page())..a.max(head.page()) + 1,
+        match (self.anchor, self.head, self.range) {
+            (Some((a, _)), Some(head), _) => a.min(head.page())..a.max(head.page()) + 1,
+            (None, _, Some((lo, hi))) => lo.page..hi.page + 1,
             _ => 0..0,
         }
     }
@@ -92,10 +101,12 @@ impl Selection {
         self.range
     }
 
-    /// Recomputes the range: the anchor's char (within `ANCHOR_CAP`) through the char nearest the
-    /// head, both included. `None` while the anchor misses text or a needed page is not loaded.
+    /// Recomputes a dragged range: the anchor's char (within `ANCHOR_CAP`) through the char nearest
+    /// the head, both included. `None` while the anchor misses text or a needed page is not loaded.
     pub fn resolve(&mut self, texts: &PageTexts) {
-        self.range = self.compute(texts);
+        if self.anchor.is_some() {
+            self.range = self.compute(texts);
+        }
     }
 
     /// The selected text for the clipboard.
@@ -109,35 +120,22 @@ impl Selection {
         let head = self.head?;
         let chars = texts.get(&head.page())?;
         let (head_lo, head_hi) = match head {
-            Probe::At(p, pt) => nearest(chars, pt, f32::INFINITY).map_or(
-                (Caret { page: p, index: 0 }, Caret { page: p, index: 0 }),
-                |i| {
-                    (
-                        Caret { page: p, index: i },
-                        Caret {
-                            page: p,
-                            index: i + 1,
-                        },
-                    )
-                },
-            ),
-            Probe::Start(p) => (Caret { page: p, index: 0 }, Caret { page: p, index: 0 }),
-            Probe::End(p) => {
-                let end = Caret {
-                    page: p,
-                    index: chars.len(),
-                };
-                (end, end)
-            }
+            Probe::At(p, pt) => nearest(chars, pt, f32::INFINITY)
+                .map_or((caret(p, 0), caret(p, 0)), |i| {
+                    (caret(p, i), caret(p, i + 1))
+                }),
+            Probe::Start(p) => (caret(p, 0), caret(p, 0)),
+            Probe::End(p) => (caret(p, chars.len()), caret(p, chars.len())),
         };
-        let lo = Caret { page, index }.min(head_lo);
-        let hi = Caret {
-            page,
-            index: index + 1,
-        }
-        .max(head_hi);
-        Some((lo, hi))
+        Some((
+            caret(page, index).min(head_lo),
+            caret(page, index + 1).max(head_hi),
+        ))
     }
+}
+
+fn caret(page: usize, index: usize) -> Caret {
+    Caret { page, index }
 }
 
 /// Index of the char whose box is nearest to `p` (page points), if within `cap` points. Among
@@ -167,7 +165,7 @@ pub fn probe(layout: &PageLayout, doc: Pos2) -> Option<Probe> {
         return Some(Probe::End(last));
     };
     if doc.y >= r.min.y {
-        return Some(Probe::At(page, ((doc - r.min) / layout.scale()).to_pos2()));
+        return Some(Probe::At(page, layout.to_page(page, doc)));
     }
     Some(match page.checked_sub(1) {
         Some(above) if doc.y - rects[above].max.y < r.min.y - doc.y => Probe::End(above),
@@ -186,7 +184,7 @@ pub fn page_span(lo: Caret, hi: Caret, page: usize, len: usize) -> Range<usize> 
 }
 
 /// The chars of `[lo, hi)`. pdfium's own `\r\n` chars are kept; pages are joined with `\n`.
-pub fn copy_text(texts: &PageTexts, lo: Caret, hi: Caret) -> String {
+fn copy_text(texts: &PageTexts, lo: Caret, hi: Caret) -> String {
     let mut out = String::new();
     for page in lo.page..=hi.page {
         if page > lo.page {
@@ -198,6 +196,54 @@ pub fn copy_text(texts: &PageTexts, lo: Caret, hi: Caret) -> String {
         }
     }
     out
+}
+
+/// The run of chars around `i` for which `keep` holds, as indices; `i` itself is always in it.
+fn run_around(chars: &[CharBox], i: usize, keep: impl Fn(&CharBox) -> bool) -> Range<usize> {
+    let start = chars[..i]
+        .iter()
+        .rposition(|c| !keep(c))
+        .map_or(0, |p| p + 1);
+    let end = chars[i..]
+        .iter()
+        .position(|c| !keep(c))
+        .map_or(chars.len(), |p| i + p);
+    start..end
+}
+
+/// pdfium's generated chars (spaces, line breaks) have no box.
+fn is_boxless(c: &CharBox) -> bool {
+    c.rect.width() <= 0.0 || c.rect.height() <= 0.0
+}
+
+/// The word around char `i`: the run of non-whitespace chars containing it. A whitespace char
+/// selects just itself.
+pub fn word_at(chars: &[CharBox], i: usize) -> Range<usize> {
+    let Some(at) = chars.get(i) else {
+        return chars.len()..chars.len();
+    };
+    if at.ch.is_whitespace() {
+        return i..i + 1;
+    }
+    run_around(chars, i, |c| !c.ch.is_whitespace())
+}
+
+/// The line around char `i`: the neighbours whose boxes share its line (see [`runs`]). Boxless
+/// chars inside the line are kept, and the line breaks ending it too, so a copied line keeps its
+/// newline; boxless chars before its first glyph are not.
+pub fn line_at(chars: &[CharBox], i: usize) -> Range<usize> {
+    let Some(at) = chars.get(i) else {
+        return chars.len()..chars.len();
+    };
+    if is_boxless(at) {
+        return i..i + 1;
+    }
+    let line = run_around(chars, i, |c| is_boxless(c) || same_line(at.rect, c.rect));
+    let lead = chars[line.clone()]
+        .iter()
+        .take_while(|c| is_boxless(c))
+        .count();
+    line.start + lead..line.end
 }
 
 /// Highlight rects for consecutive selected chars: one per text line. A char joins the run when
@@ -230,7 +276,7 @@ mod tests {
     use super::*;
     use egui::pos2;
 
-    use crate::layout::PageSize;
+    use crate::layout::{PageSize, Rotation};
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
         Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))
@@ -259,12 +305,8 @@ mod tests {
     fn texts(pages: &[(usize, Vec<CharBox>)]) -> PageTexts {
         pages
             .iter()
-            .map(|(p, chars)| (*p, Arc::from(chars.as_slice())))
+            .map(|(p, chars)| (*p, chars.as_slice().into()))
             .collect()
-    }
-
-    fn caret(page: usize, index: usize) -> Caret {
-        Caret { page, index }
     }
 
     #[test]
@@ -353,7 +395,7 @@ mod tests {
         sel.drag_to(Probe::At(1, pos2(5.0, 5.0)));
         sel.resolve(&t);
         assert_eq!(sel.range(), None);
-        t.insert(1, Arc::from(line("de", 0.0).as_slice()));
+        t.insert(1, line("de", 0.0).into());
         sel.resolve(&t);
         assert_eq!(sel.range(), Some((caret(0, 0), caret(1, 1))));
     }
@@ -372,11 +414,59 @@ mod tests {
     }
 
     #[test]
+    fn select_sets_range_without_anchor() {
+        let t = texts(&[(2, line("ab cd", 0.0))]);
+        let mut sel = Selection::default();
+        sel.select(2, 3..5);
+        assert!(!sel.is_empty());
+        assert_eq!(sel.range(), Some((caret(2, 3), caret(2, 5))));
+        assert_eq!(sel.pages(), 2..3);
+        // Chars arriving later must not disturb a click selection.
+        sel.resolve(&t);
+        assert_eq!(sel.text(&t), Some("cd".to_owned()));
+    }
+
+    #[test]
+    fn word_at_values() {
+        let chars = line("ab cd\r\n", 0.0);
+        assert_eq!(word_at(&chars, 0), 0..2);
+        assert_eq!(word_at(&chars, 4), 3..5);
+        assert_eq!(word_at(&chars, 2), 2..3);
+        assert_eq!(word_at(&chars, 9), 7..7);
+        assert_eq!(word_at(&[], 0), 0..0);
+    }
+
+    #[test]
+    fn line_at_values() {
+        let mut chars = line("ab cd\r\n", 0.0);
+        chars.extend(line("ef", 12.0));
+        assert_eq!(line_at(&chars, 1), 0..7);
+        assert_eq!(line_at(&chars, 8), 7..9);
+        assert_eq!(line_at(&chars, 20), 9..9);
+        // A boxless char selects only itself.
+        assert_eq!(line_at(&chars, 5), 5..6);
+    }
+
+    #[test]
+    fn line_at_spans_generated_spaces() {
+        // pdfium gives generated spaces a zero-size box; they must not split the line.
+        let mut chars = line("ab", 0.0);
+        chars.push(CharBox {
+            rect: rect(20.0, 8.0, 20.0, 8.0),
+            ch: ' ',
+        });
+        chars.extend(line("cd", 0.0));
+        assert_eq!(line_at(&chars, 4), 0..5);
+        assert_eq!(line_at(&chars, 0), 0..5);
+    }
+
+    #[test]
     fn probe_maps_pages_and_gaps() {
         // Pages at y 30..830, 850..1650, 1670..2470; x 100..700.
         let l = PageLayout::new(
             &[PageSize { w: 600.0, h: 800.0 }; 3],
             1.0,
+            Rotation::R0,
             800.0,
             20.0,
             30.0,
@@ -390,7 +480,14 @@ mod tests {
         assert_eq!(probe(&l, pos2(400.0, 10.0)), Some(Probe::Start(0)));
         assert_eq!(probe(&l, pos2(400.0, 3000.0)), Some(Probe::End(2)));
         assert_eq!(probe(&PageLayout::default(), pos2(0.0, 0.0)), None);
-        let zoomed = PageLayout::new(&[PageSize { w: 600.0, h: 800.0 }], 2.0, 800.0, 20.0, 30.0);
+        let zoomed = PageLayout::new(
+            &[PageSize { w: 600.0, h: 800.0 }],
+            2.0,
+            Rotation::R0,
+            800.0,
+            20.0,
+            30.0,
+        );
         assert_eq!(
             probe(&zoomed, pos2(50.0, 70.0)),
             Some(Probe::At(0, pos2(10.0, 20.0)))

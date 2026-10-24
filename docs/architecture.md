@@ -1,5 +1,9 @@
 # Paperlight: architecture and implementation contract
 
+Phase 5 contract, kept as written. Later rounds (kinetic scrolling, text selection, rotation,
+password prompt, system theme) are recorded in `implementation-notes.md`; where the two differ,
+the code and the notes are current.
+
 This document is binding for phase 5 (Implementation). Sources, in priority order:
 
 1. The plan's **Decisions** table (`~/.claude/plans/goal-create-for-me-purring-lobster.md`). It is fixed.

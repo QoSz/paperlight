@@ -3,9 +3,11 @@
 //! winit 0.30 has no Wayland pinch support, so this opens a second event queue on winit's
 //! connection and forwards pinch scale changes to the UI thread.
 
-use std::thread;
+use std::{
+    sync::mpsc::{Receiver, Sender, channel},
+    thread,
+};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use tracing::debug;
 use wayland_client::{
@@ -39,7 +41,7 @@ pub fn start(cc: &eframe::CreationContext<'_>, ctx: egui::Context) -> Option<Rec
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
-    let (tx, rx) = unbounded();
+    let (tx, rx) = channel();
     let mut state = State {
         tx,
         ctx,

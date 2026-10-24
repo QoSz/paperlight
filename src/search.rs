@@ -13,10 +13,10 @@ pub struct Hit {
 #[derive(Debug, Default)]
 pub struct SearchState {
     pub query: String,
-    pub generation: u64,
-    pub hits: Vec<Hit>,
+    generation: u64,
+    hits: Vec<Hit>,
     pub current: Option<usize>,
-    pub pending: bool,
+    pending: bool,
 }
 
 impl SearchState {

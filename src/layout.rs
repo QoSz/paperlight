@@ -2,11 +2,11 @@
 
 use std::ops::Range;
 
-use egui::{Rangef, Rect, Vec2, pos2, vec2};
+use egui::{Pos2, Rangef, Rect, Vec2, pos2, vec2};
 
 /// Smallest and largest zoom (egui points per PDF point).
-pub const MIN_ZOOM: f32 = 0.25;
-pub const MAX_ZOOM: f32 = 6.0;
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 6.0;
 /// Multiplicative step for Ctrl+= / Ctrl+- and the toolbar buttons.
 pub const ZOOM_STEP: f32 = 1.25;
 /// Render scales, as multiples of pixels-per-point.
@@ -19,33 +19,122 @@ pub struct PageSize {
     pub h: f32,
 }
 
-/// Page rectangles in doc space for one zoom and viewport width.
+/// A clockwise rotation by quarter turns. Used for a page's `/Rotate` (worker) and for the
+/// viewer's rotation (UI); both map points of an unrotated page, top-left origin, to the rotated one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    #[default]
+    R0,
+    R90,
+    R180,
+    R270,
+}
+
+impl Rotation {
+    /// From a count of clockwise quarter turns (any integer).
+    pub fn from_quarter_turns(n: i32) -> Self {
+        match n.rem_euclid(4) {
+            1 => Self::R90,
+            2 => Self::R180,
+            3 => Self::R270,
+            _ => Self::R0,
+        }
+    }
+
+    fn quarter_turns(self) -> i32 {
+        match self {
+            Self::R0 => 0,
+            Self::R90 => 1,
+            Self::R180 => 2,
+            Self::R270 => 3,
+        }
+    }
+
+    /// One more quarter turn clockwise (`true`) or counter-clockwise.
+    pub fn turned(self, clockwise: bool) -> Self {
+        Self::from_quarter_turns(self.quarter_turns() + if clockwise { 1 } else { -1 })
+    }
+
+    pub fn inverse(self) -> Self {
+        Self::from_quarter_turns(-self.quarter_turns())
+    }
+
+    /// Size of a `size` page after this rotation.
+    pub fn size(self, size: PageSize) -> PageSize {
+        match self {
+            Self::R0 | Self::R180 => size,
+            Self::R90 | Self::R270 => PageSize {
+                w: size.h,
+                h: size.w,
+            },
+        }
+    }
+
+    /// `p` (page points, top-left origin) of an unrotated `size` page, in the rotated page.
+    pub fn point(self, p: Pos2, size: PageSize) -> Pos2 {
+        match self {
+            Self::R0 => p,
+            Self::R90 => pos2(size.h - p.y, p.x),
+            Self::R180 => pos2(size.w - p.x, size.h - p.y),
+            Self::R270 => pos2(p.y, size.w - p.x),
+        }
+    }
+
+    /// `r` of an unrotated `size` page, in the rotated page (rects stay axis-aligned).
+    pub fn rect(self, r: Rect, size: PageSize) -> Rect {
+        Rect::from_two_pos(self.point(r.min, size), self.point(r.max, size))
+    }
+
+    /// Texture coordinates of the rotated page's top-left, top-right, bottom-left and bottom-right
+    /// corners, for a texture rendered unrotated.
+    pub fn uv_corners(self) -> [Pos2; 4] {
+        let unit = PageSize { w: 1.0, h: 1.0 };
+        [
+            pos2(0.0, 0.0),
+            pos2(1.0, 0.0),
+            pos2(0.0, 1.0),
+            pos2(1.0, 1.0),
+        ]
+        .map(|c| self.inverse().point(c, unit))
+    }
+}
+
+/// Page rectangles in doc space for one zoom, rotation and viewport width.
 #[derive(Debug, Default)]
 pub struct PageLayout {
     rects: Vec<Rect>,
     content: Vec2,
     scale: f32,
+    rotation: Rotation,
     gap: f32,
 }
 
 impl PageLayout {
-    /// Stacks pages top to bottom (`margin` above the first and below the last, `gap` between),
-    /// each centred in `content.x = max(viewport_w, widest·scale + 2·margin)`.
-    pub fn new(sizes: &[PageSize], scale: f32, viewport_w: f32, gap: f32, margin: f32) -> Self {
+    /// Stacks the pages, rotated by `rotation`, top to bottom (`margin` above the first and below
+    /// the last, `gap` between), each centred in `content.x = max(viewport_w, widest·scale + 2·margin)`.
+    pub fn new(
+        sizes: &[PageSize],
+        scale: f32,
+        rotation: Rotation,
+        viewport_w: f32,
+        gap: f32,
+        margin: f32,
+    ) -> Self {
         if sizes.is_empty() {
             return Self {
                 rects: Vec::new(),
                 content: vec2(viewport_w, 0.0),
                 scale,
+                rotation,
                 gap,
             };
         }
-        let widest = sizes.iter().map(|s| s.w).fold(0.0, f32::max);
-        let content_w = viewport_w.max(widest * scale + 2.0 * margin);
+        let content_w = viewport_w.max(widest(sizes, rotation) * scale + 2.0 * margin);
         let mut y = margin;
         let rects = sizes
             .iter()
             .map(|s| {
+                let s = rotation.size(*s);
                 let size = vec2(s.w, s.h) * scale;
                 let r = Rect::from_min_size(pos2((content_w - size.x) / 2.0, y), size);
                 y = r.max.y + gap;
@@ -56,6 +145,7 @@ impl PageLayout {
             rects,
             content: vec2(content_w, y - gap + margin),
             scale,
+            rotation,
             gap,
         }
     }
@@ -63,6 +153,11 @@ impl PageLayout {
     /// Zoom this layout was built for.
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Rotation this layout was built for.
+    pub fn rotation(&self) -> Rotation {
+        self.rotation
     }
 
     /// Total scrollable size; `(viewport_w, 0)` when there are no pages.
@@ -80,6 +175,19 @@ impl PageLayout {
         let start = self.rects.partition_point(|r| r.max.y <= view.min.y);
         let end = self.rects.partition_point(|r| r.min.y < view.max.y);
         start..end.max(start)
+    }
+
+    /// `visible_range(view)` widened by `pages` on each side.
+    pub fn around(&self, view: Rect, pages: usize) -> Range<usize> {
+        let visible = self.visible_range(view);
+        visible.start.saturating_sub(pages)..(visible.end + pages).min(self.rects.len())
+    }
+
+    /// `around(view, pages)`, but only pages within `viewports` view heights above or below `view`.
+    pub fn window(&self, view: Rect, pages: usize, viewports: f32) -> Range<usize> {
+        let around = self.around(view, pages);
+        let near = self.visible_range(view.expand2(vec2(0.0, viewports * view.height())));
+        around.start.max(near.start)..around.end.min(near.end)
     }
 
     /// Page under the point one third down the viewport; the first page at the top, the last at
@@ -122,13 +230,29 @@ impl PageLayout {
         }
     }
 
-    /// Maps a rect in page points (top-left origin) of `page` to doc space.
+    /// Maps a rect in page points (top-left origin, unrotated) of `page` to doc space.
     pub fn to_doc(&self, page: usize, r: Rect) -> Rect {
+        let r = self.rotation.rect(r, self.unrotated_size(page));
         let origin = self.rects[page].min;
         Rect::from_min_max(
             origin + r.min.to_vec2() * self.scale,
             origin + r.max.to_vec2() * self.scale,
         )
+    }
+
+    /// Maps a doc-space point within `page` to page points (top-left origin, unrotated).
+    pub fn to_page(&self, page: usize, doc: Pos2) -> Pos2 {
+        let rotated = ((doc - self.rects[page].min) / self.scale).to_pos2();
+        let size = self.rotation.size(self.unrotated_size(page));
+        self.rotation.inverse().point(rotated, size)
+    }
+
+    fn unrotated_size(&self, page: usize) -> PageSize {
+        let rotated = self.rects[page].size() / self.scale;
+        self.rotation.inverse().size(PageSize {
+            w: rotated.x,
+            h: rotated.y,
+        })
     }
 
     /// First page whose bottom is at or below `y` (the next page when `y` is in a gap), else the last.
@@ -139,14 +263,41 @@ impl PageLayout {
     }
 }
 
-/// Zoom that fits the widest page in `viewport_w - 2·margin`, clamped; 1.0 if `sizes` is empty.
-pub fn fit_width_scale(sizes: &[PageSize], viewport_w: f32, margin: f32) -> f32 {
-    let widest = sizes.iter().map(|s| s.w).fold(0.0, f32::max);
+/// Width of the widest page after `rotation`; 0 if `sizes` is empty.
+fn widest(sizes: &[PageSize], rotation: Rotation) -> f32 {
+    sizes
+        .iter()
+        .map(|s| rotation.size(*s).w)
+        .fold(0.0, f32::max)
+}
+
+/// `visible` (the pages on screen) first, then the pages of `around` above them, then below.
+pub fn visible_first(visible: Range<usize>, around: Range<usize>) -> impl Iterator<Item = usize> {
+    let (above, below) = (around.start..visible.start, visible.end..around.end);
+    visible.chain(above).chain(below)
+}
+
+/// Zoom that fits the widest page (after `rotation`) in `viewport_w - 2·margin`, clamped; 1.0 if
+/// `sizes` is empty.
+pub fn fit_width_scale(
+    sizes: &[PageSize],
+    rotation: Rotation,
+    viewport_w: f32,
+    margin: f32,
+) -> f32 {
+    let widest = widest(sizes, rotation);
     if widest > 0.0 {
         clamp_zoom((viewport_w - 2.0 * margin) / widest)
     } else {
         1.0
     }
+}
+
+/// The render scale `wanted_px` (bucketed and GPU-capped) is above the one fit width (`fit`) renders
+/// at: the page is zoomed in. Fit width's bucket or a lower one is not. `wanted_px` is already
+/// capped, so fit width's bucket needs no cap here.
+pub fn zoomed_in(wanted_px: f32, fit: f32, ppp: f32) -> bool {
+    wanted_px > scale_bucket(fit, ppp)
 }
 
 /// Clamps to `MIN_ZOOM..=MAX_ZOOM`.
@@ -264,7 +415,7 @@ mod tests {
 
     /// Fixture F: three 600×800 pages at zoom `scale`, viewport 800, gap 20, margin 30.
     fn f(scale: f32) -> PageLayout {
-        PageLayout::new(&[A4ISH; 3], scale, 800.0, 20.0, 30.0)
+        PageLayout::new(&[A4ISH; 3], scale, Rotation::R0, 800.0, 20.0, 30.0)
     }
 
     /// Viewport rect `0..800` wide, `a..b` tall.
@@ -296,7 +447,7 @@ mod tests {
 
     #[test]
     fn new_widens_content_for_wide_page() {
-        let l = PageLayout::new(&[A4ISH], 1.0, 500.0, 20.0, 30.0);
+        let l = PageLayout::new(&[A4ISH], 1.0, Rotation::R0, 500.0, 20.0, 30.0);
         assert!(close(l.content_size().x, 660.0));
         assert_eq!(l.rects()[0].x_range(), 30.0..=630.0);
     }
@@ -310,7 +461,7 @@ mod tests {
 
     #[test]
     fn new_empty() {
-        let l = PageLayout::new(&[], 1.0, 800.0, 20.0, 30.0);
+        let l = PageLayout::new(&[], 1.0, Rotation::R0, 800.0, 20.0, 30.0);
         assert_eq!(l.rects(), []);
         assert_eq!(l.content_size(), vec2(800.0, 0.0));
     }
@@ -333,6 +484,47 @@ mod tests {
     #[test]
     fn visible_range_empty_layout() {
         assert_eq!(PageLayout::default().visible_range(view(0.0, 600.0)), 0..0);
+    }
+
+    /// 40 Letter pages at `zoom` in a 900 pt wide viewport, with the app's gap and margin.
+    fn letters(zoom: f32) -> PageLayout {
+        let sizes = [PageSize { w: 612.0, h: 792.0 }; 40];
+        PageLayout::new(&sizes, zoom, Rotation::R0, 900.0, 24.0, 32.0)
+    }
+
+    #[test]
+    fn window_matches_page_windows_up_to_250_percent() {
+        for zoom in [836.0 / 612.0, 2.0, 2.5] {
+            let l = letters(zoom);
+            let n = l.rects().len();
+            let around = |v: &Range<usize>, k: usize| v.start.saturating_sub(k)..(v.end + k).min(n);
+            let mut y = 0.0;
+            while y + 1048.0 <= l.content_size().y {
+                let view = Rect::from_min_size(pos2(0.0, y), vec2(900.0, 1048.0));
+                let visible = l.visible_range(view);
+                assert_eq!(l.window(view, 1, 2.0), around(&visible, 1), "{zoom} at {y}");
+                assert_eq!(l.window(view, 2, 4.0), around(&visible, 2), "{zoom} at {y}");
+                y += 7.0;
+            }
+        }
+    }
+
+    #[test]
+    fn window_skips_far_neighbours_at_600_percent() {
+        let l = letters(6.0);
+        // A 900 pt view centred on page 5 (4752 pt tall): both neighbours are over 2 views away.
+        let view = Rect::from_center_size(l.rects()[5].center(), vec2(900.0, 900.0));
+        assert_eq!(l.window(view, 1, 2.0), 5..6);
+        // Its bottom 1700 pt above page 6, within 2 views: page 6 is in, page 4 still out.
+        let view = view.translate(vec2(0.0, l.rects()[6].min.y - 1700.0 - view.max.y));
+        assert_eq!(l.window(view, 1, 2.0), 5..7);
+    }
+
+    #[test]
+    fn visible_first_orders_visible_then_above_then_below() {
+        assert_eq!(visible_first(3..5, 2..6).collect::<Vec<_>>(), [3, 4, 2, 5]);
+        // In a gap nothing is visible: the page above, then the one below.
+        assert_eq!(visible_first(4..4, 3..5).collect::<Vec<_>>(), [3, 4]);
     }
 
     #[test]
@@ -367,7 +559,8 @@ mod tests {
         let (vw, vh) = (900.0, 1056.0);
         let l = PageLayout::new(
             &[slide; 24],
-            fit_width_scale(&[slide], vw, 32.0),
+            fit_width_scale(&[slide], Rotation::R0, vw, 32.0),
+            Rotation::R0,
             vw,
             24.0,
             32.0,
@@ -409,7 +602,7 @@ mod tests {
     #[test]
     fn step_page_short_pages_never_skips() {
         let slide = PageSize { w: 720.0, h: 405.0 };
-        let l = PageLayout::new(&[slide; 5], 1.0, 800.0, 24.0, 32.0);
+        let l = PageLayout::new(&[slide; 5], 1.0, Rotation::R0, 800.0, 24.0, 32.0);
         let y = l.page_scroll_y(1);
         assert_eq!(l.step_page(y, true), 2);
         assert_eq!(l.step_page(y, false), 0);
@@ -422,9 +615,97 @@ mod tests {
     }
 
     #[test]
+    fn rotation_turns_and_inverts() {
+        assert_eq!(Rotation::R0.turned(true), Rotation::R90);
+        assert_eq!(Rotation::R0.turned(false), Rotation::R270);
+        assert_eq!(Rotation::R270.turned(true), Rotation::R0);
+        assert_eq!(Rotation::from_quarter_turns(6), Rotation::R180);
+        assert_eq!(Rotation::from_quarter_turns(-1), Rotation::R270);
+        for r in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            assert_eq!(
+                Rotation::from_quarter_turns(r.quarter_turns() + r.inverse().quarter_turns()),
+                Rotation::R0
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_maps_points_and_sizes() {
+        let size = PageSize { w: 600.0, h: 800.0 };
+        let p = pos2(100.0, 50.0);
+        assert_eq!(Rotation::R90.size(size), PageSize { w: 800.0, h: 600.0 });
+        assert_eq!(Rotation::R180.size(size), size);
+        // Clockwise: the top-left corner goes to the top-right.
+        assert_eq!(Rotation::R90.point(pos2(0.0, 0.0), size), pos2(800.0, 0.0));
+        assert_eq!(Rotation::R90.point(p, size), pos2(750.0, 100.0));
+        assert_eq!(Rotation::R180.point(p, size), pos2(500.0, 750.0));
+        assert_eq!(Rotation::R270.point(p, size), pos2(50.0, 500.0));
+        for r in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            let back = r.inverse().point(r.point(p, size), r.size(size));
+            assert_eq!(back, p, "{r:?}");
+        }
+        assert_eq!(
+            Rotation::R90.rect(rect(10.0, 20.0, 30.0, 40.0), size),
+            rect(760.0, 10.0, 780.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn rotation_uv_corners() {
+        assert_eq!(
+            Rotation::R0.uv_corners(),
+            [
+                pos2(0.0, 0.0),
+                pos2(1.0, 0.0),
+                pos2(0.0, 1.0),
+                pos2(1.0, 1.0)
+            ]
+        );
+        // Rotated 90° clockwise, the displayed top-left shows the texture's bottom-left.
+        assert_eq!(
+            Rotation::R90.uv_corners(),
+            [
+                pos2(0.0, 1.0),
+                pos2(0.0, 0.0),
+                pos2(1.0, 1.0),
+                pos2(1.0, 0.0)
+            ]
+        );
+        assert_eq!(
+            Rotation::R180.uv_corners(),
+            [
+                pos2(1.0, 1.0),
+                pos2(0.0, 1.0),
+                pos2(1.0, 0.0),
+                pos2(0.0, 0.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn rotated_layout_swaps_sizes_and_maps_rects() {
+        let l = PageLayout::new(&[A4ISH; 2], 1.0, Rotation::R90, 1000.0, 20.0, 30.0);
+        assert_eq!(l.rects()[0], rect(100.0, 30.0, 900.0, 630.0));
+        assert_eq!(l.content_size(), vec2(1000.0, 1280.0));
+        // A rect near the unrotated top-left lands near the rotated top-right.
+        assert_eq!(
+            l.to_doc(0, rect(10.0, 20.0, 30.0, 40.0)),
+            rect(860.0, 40.0, 880.0, 60.0)
+        );
+        assert_eq!(l.to_page(0, pos2(880.0, 40.0)), pos2(10.0, 20.0));
+        assert!(close(
+            fit_width_scale(&[A4ISH], Rotation::R90, 864.0, 32.0),
+            1.0
+        ));
+    }
+
+    #[test]
     fn fit_width_basic() {
         let letter = PageSize { w: 612.0, h: 792.0 };
-        assert!(close(fit_width_scale(&[letter], 676.0, 32.0), 1.0));
+        assert!(close(
+            fit_width_scale(&[letter], Rotation::R0, 676.0, 32.0),
+            1.0
+        ));
     }
 
     #[test]
@@ -433,20 +714,58 @@ mod tests {
             w: 1200.0,
             h: 800.0,
         };
-        assert!(close(fit_width_scale(&[A4ISH, wide], 664.0, 32.0), 0.5));
+        assert!(close(
+            fit_width_scale(&[A4ISH, wide], Rotation::R0, 664.0, 32.0),
+            0.5
+        ));
     }
 
     #[test]
     fn fit_width_empty_is_one() {
-        assert!(close(fit_width_scale(&[], 800.0, 32.0), 1.0));
+        assert!(close(fit_width_scale(&[], Rotation::R0, 800.0, 32.0), 1.0));
     }
 
     #[test]
     fn fit_width_clamped() {
         let tiny = PageSize { w: 100.0, h: 100.0 };
         let letter = PageSize { w: 612.0, h: 792.0 };
-        assert!(close(fit_width_scale(&[tiny], 10_000.0, 32.0), 6.0));
-        assert!(close(fit_width_scale(&[letter], 100.0, 32.0), 0.25));
+        assert!(close(
+            fit_width_scale(&[tiny], Rotation::R0, 10_000.0, 32.0),
+            6.0
+        ));
+        assert!(close(
+            fit_width_scale(&[letter], Rotation::R0, 100.0, 32.0),
+            0.25
+        ));
+    }
+
+    #[test]
+    fn zoomed_in_compares_render_scales() {
+        // Fit width at 900 pt renders at bucket 1.5; `px` is app.rs's capped render scale.
+        let fit = 836.0 / 612.0;
+        let px = |zoom: f32, cap: f32| scale_bucket(zoom, 1.0).min(cap);
+        let free = f32::INFINITY;
+        assert!(!zoomed_in(px(fit, free), fit, 1.0));
+        assert!(!zoomed_in(px(fit * 1.05, free), fit, 1.0), "same bucket");
+        assert!(
+            zoomed_in(px(fit * ZOOM_STEP, free), fit, 1.0),
+            "next bucket"
+        );
+        assert!(!zoomed_in(px(fit / ZOOM_STEP, free), fit, 1.0), "below fit");
+        assert!(
+            !zoomed_in(px(fit * 3.0, 1.5), fit, 1.0),
+            "GPU cap at fit's scale"
+        );
+        assert!(
+            !zoomed_in(px(fit * 3.0, 1.25), fit, 1.0),
+            "GPU cap below fit's scale"
+        );
+        // Maximized 1080p, A4 at fit width (3.12) already renders at the top bucket.
+        assert!(!zoomed_in(px(6.0, free), 3.12, 1.0));
+        assert!(
+            zoomed_in(px(fit * ZOOM_STEP, free) * 2.0, fit, 2.0),
+            "HiDPI"
+        );
     }
 
     #[test]

@@ -8,16 +8,15 @@ license = "MIT"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
-egui = "0.37"
+egui = { version = "0.37", features = ["bytemuck"] }
 egui-winit = { version = "0.37", default-features = false, features = ["smithay-clipboard"] }
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
-crossbeam-channel = "0.5"
 raw-window-handle = "0.6"
 wayland-client = { version = "0.31", features = ["system"] }
-winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+libc = "0.2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 
 [profile.release]
 opt-level = 3
